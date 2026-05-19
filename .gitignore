@@ -1,0 +1,14 @@
+.DS_Store
+.build/
+.swiftpm/
+*.xcodeproj/
+DerivedData/
+Package.resolved
+.xcdd/
+*.profraw
+# DocC static-site build output (Scripts/build_docs.sh writes here).
+# Pages deploys via Actions / gh-pages branch, not from main:/docs.
+/docs/
+# Claude Code per-project settings (permissions allow-list, etc.).
+# Machine-local, no value in version control.
+.claude/
