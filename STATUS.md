@@ -1,6 +1,6 @@
 # MetalRadixSort — Status
 
-**As of 2026-05-18: working.** 1M u64-pair sort in ~3.7 ms on Apple M5 Max.
+**As of 2026-05-19: working.** 1M u64-pair sort in ~3.5 ms on Apple M5 Max.
 All probe and edge-case tests pass with zero monotonicity failures.
 
 ## What works
@@ -69,8 +69,8 @@ real writes).
 
 ## Future work (queued)
 
-Both are deliberate omissions, not bugs. Document the workaround on the
-caller side until/unless we invest in the kernel work.
+A deliberate omission, not a bug. Document the workaround on the caller
+side until/unless we invest in the kernel work.
 
 ### Stability across equal keys
 
@@ -96,27 +96,26 @@ deterministic cross-TG and within-TG ordering:
 Estimated ~1-2 days, ~10-15% perf cost. The same architecture pattern as
 NVIDIA Onesweep, minus the chained-lookback.
 
+## Done since 0.1.0
+
 ### Bit-range hint (`beginBit` / `endBit`)
 
-`cub::DeviceRadixSort::SortPairs` takes `(begin_bit, end_bit)` to skip
-known-zero high/low bits. The gsplat call passes `0, 32 + tile_n_bits +
-cam_n_bits` — typically ~50 — so CUB skips ~14 bits of work. Our wrapper
-always processes all 8 bytes.
+`MetalRadixSortU64Pairs.encode(...)` now takes optional `beginBit` and
+`endBit` parameters mirroring `cub::DeviceRadixSort::SortPairs`. Defaults
+preserve the full 64-bit sort. Pass `endBit = 32 + tile_n_bits + cam_n_bits`
+for gsplat tile-keys to skip the unused high bytes.
 
-The change is byte-aligned (cheap):
-- Add `beginBit: Int = 0, endBit: Int = 64` to
-  `MetalRadixSortU64Pairs.encode(...)`.
-- Derive `msdByte = (endBit - 1) / 8`, `firstByte = beginBit / 8` inside the
-  wrapper; thread `msdByte * 8` into `SortParams.shift` and dispatch the
-  inner kernel for bytes `[firstByte, msdByte)`. No kernel changes.
-- Add a `sort_copy_keys_64` kernel for the parity-mismatch case (when the
-  number of inner passes is even, the final result lands in scratch
-  instead of the caller's buffer).
+Resolution is byte-precise (rounds to byte boundaries), not bit-precise —
+documented in the `encode` doc comment. Implementation:
+- Wrapper derives `msdByte = (endBit - 1) / 8`, `firstByte = beginBit / 8`
+  and dispatches MSD on `msdByte`, inner LSD on `[firstByte, msdByte)`.
+- New `sort_copy_keys_64` kernel handles the parity-mismatch case where
+  `innerBytes` is even and keys would otherwise land in scratch.
+- Value ping-pong picks the final gather source dynamically so values
+  don't need a copy.
 
-For typical gsplat (`endBit=50`) this is 7 dispatches instead of 8, ~12%
-faster. For depth-only sort (`endBit=32`), 4 instead of 8, ~50% faster.
-Semantics are byte-precise, not bit-precise — `endBit=50` and `endBit=56`
-dispatch identically. Documented as a known difference from CUB.
+Tests: `testEndBit32`, `testEndBit50`, `testEndBit8`, `testBeginBit8`,
+`testEndBit64MatchesDefault`. All passing.
 
 ## Useful artifacts
 

@@ -12,7 +12,7 @@ intermediate copies, one command buffer. On Apple Silicon (M-series),
 The library exposes a single type: ``MetalRadixSortU64Pairs``. You
 construct it once per device with an upper-bound element count
 (scratch buffers and pipeline state objects are sized at construction
-time), then call ``MetalRadixSortU64Pairs/encode(onto:keys:values:count:)``
+time), then call ``MetalRadixSortU64Pairs/encode(onto:keys:values:count:beginBit:endBit:)``
 on each sort. The caller owns the command buffer and decides when to
 commit.
 
@@ -66,7 +66,7 @@ the caller's values into the caller's values buffer.
   caller needs an explicit permutation.
 - The maximum element count is fixed at construction time; exceeding
   it triggers a `precondition` in
-  ``MetalRadixSortU64Pairs/encode(onto:keys:values:count:)``.
+  ``MetalRadixSortU64Pairs/encode(onto:keys:values:count:beginBit:endBit:)``.
 
 ## Topics
 
@@ -74,7 +74,7 @@ the caller's values into the caller's values buffer.
 
 - ``MetalRadixSortU64Pairs``
 - ``MetalRadixSortU64Pairs/init(device:maxElements:)``
-- ``MetalRadixSortU64Pairs/encode(onto:keys:values:count:)``
+- ``MetalRadixSortU64Pairs/encode(onto:keys:values:count:beginBit:endBit:)``
 
 ### Errors
 

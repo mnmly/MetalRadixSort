@@ -18,7 +18,9 @@ final class MetalRadixSortU64PairsTests: XCTestCase {
     private func runSort(
         keys inputKeys: [UInt64],
         device: MTLDevice,
-        sorter: MetalRadixSortU64Pairs
+        sorter: MetalRadixSortU64Pairs,
+        beginBit: Int = 0,
+        endBit: Int = 64
     ) throws -> (keys: [UInt64], values: [UInt32]) {
         let count = inputKeys.count
         if count == 0 {
@@ -41,7 +43,8 @@ final class MetalRadixSortU64PairsTests: XCTestCase {
         let queue = try XCTUnwrap(device.makeCommandQueue())
         let cmd = try XCTUnwrap(queue.makeCommandBuffer())
         let enc = try XCTUnwrap(cmd.makeComputeCommandEncoder())
-        sorter.encode(onto: enc, keys: keysBuf, values: valsBuf, count: count)
+        sorter.encode(onto: enc, keys: keysBuf, values: valsBuf, count: count,
+                      beginBit: beginBit, endBit: endBit)
         enc.endEncoding()
         cmd.commit()
         cmd.waitUntilCompleted()
@@ -263,6 +266,87 @@ final class MetalRadixSortU64PairsTests: XCTestCase {
             let keys: [UInt64] = (0..<3000).map { UInt64(2_999 - $0) * 100 }
             let out = try runSort(keys: keys, device: device, sorter: sorter)
             assertSortedPaired(inputKeys: keys, outKeys: out.keys, outVals: out.values)
+        }
+    }
+
+    // MARK: - Bit-range hint
+
+    /// `endBit=32` sorts only the lower 32 bits. Keys with upper 32 bits
+    /// zero must come out fully sorted — the upper bytes are unused but
+    /// still pass through the kernel correctly. Exercises innerBytes=3
+    /// (odd → no copy dispatch).
+    func testEndBit32() throws {
+        let device = try makeDevice()
+        let n = 50_000
+        let sorter = try MetalRadixSortU64Pairs(device: device, maxElements: n)
+        let keys: [UInt64] = (0..<n).map { _ in UInt64(UInt32.random(in: 0...UInt32.max)) }
+        let out = try runSort(keys: keys, device: device, sorter: sorter, endBit: 32)
+        assertSortedPaired(inputKeys: keys, outKeys: out.keys, outVals: out.values)
+    }
+
+    /// `endBit=50` is the typical gsplat tile-key width
+    /// (`32 + tile_n_bits + cam_n_bits` with cam=2, tile=16). Rounded up
+    /// to byte 6 as MSD, so innerBytes=6 (even → copy dispatch fires).
+    /// Verifies the parity-driven copy path is correct.
+    func testEndBit50() throws {
+        let device = try makeDevice()
+        let n = 50_000
+        let sorter = try MetalRadixSortU64Pairs(device: device, maxElements: n)
+        let mask: UInt64 = (1 << 50) - 1  // keep only bits 0..49
+        let keys: [UInt64] = (0..<n).map { _ in UInt64.random(in: 0...UInt64.max) & mask }
+        let out = try runSort(keys: keys, device: device, sorter: sorter, endBit: 50)
+        assertSortedPaired(inputKeys: keys, outKeys: out.keys, outVals: out.values)
+    }
+
+    /// `endBit=8` is the degenerate single-byte case: only the MSD scatter
+    /// runs, no inner passes. innerBytes=0 (even → copy fires).
+    func testEndBit8() throws {
+        let device = try makeDevice()
+        let n = 10_000
+        let sorter = try MetalRadixSortU64Pairs(device: device, maxElements: n)
+        let keys: [UInt64] = (0..<n).map { _ in UInt64.random(in: 0...255) }
+        let out = try runSort(keys: keys, device: device, sorter: sorter, endBit: 8)
+        var failures = 0
+        for i in 1..<n where out.keys[i-1] > out.keys[i] { failures += 1 }
+        // Single-byte path is non-stable (only MSD runs), so check only
+        // monotonicity and that each value points back to a matching key.
+        XCTAssertEqual(failures, 0, "endBit=8 non-monotonic")
+        for i in 0..<n {
+            XCTAssertEqual(keys[Int(out.values[i])], out.keys[i],
+                           "value at i=\(i) doesn't track its key")
+        }
+    }
+
+    /// `beginBit=8` skips byte 0 — keys with byte 0 = 0 must sort
+    /// correctly by bytes 1..7. innerBytes=6 (even → copy fires).
+    func testBeginBit8() throws {
+        let device = try makeDevice()
+        let n = 50_000
+        let sorter = try MetalRadixSortU64Pairs(device: device, maxElements: n)
+        // Keys with byte 0 = 0 so "ignore byte 0" produces the same order
+        // as a full sort.
+        let keys: [UInt64] = (0..<n).map { _ in UInt64.random(in: 0...UInt64.max) & ~UInt64(0xFF) }
+        let out = try runSort(keys: keys, device: device, sorter: sorter, beginBit: 8)
+        assertSortedPaired(inputKeys: keys, outKeys: out.keys, outVals: out.values)
+    }
+
+    /// `endBit=64` explicit must match the default-arg call exactly on
+    /// keys + value-tracking. Guards against the default path drifting.
+    func testEndBit64MatchesDefault() throws {
+        let device = try makeDevice()
+        let n = 10_000
+        let sorter = try MetalRadixSortU64Pairs(device: device, maxElements: n)
+        var rng = SystemRandomNumberGenerator()
+        let keys: [UInt64] = (0..<n).map { _ in UInt64.random(in: 0...UInt64.max, using: &rng) }
+        let outDefault  = try runSort(keys: keys, device: device, sorter: sorter)
+        let outExplicit = try runSort(keys: keys, device: device, sorter: sorter, endBit: 64)
+        XCTAssertEqual(outDefault.keys, outExplicit.keys,
+                       "endBit=64 explicit must match default behavior on keys")
+        // Values may differ in the equal-key non-stable case; require only
+        // that each value tracks a matching key in both runs.
+        for i in 0..<n {
+            XCTAssertEqual(keys[Int(outDefault.values[i])],  outDefault.keys[i])
+            XCTAssertEqual(keys[Int(outExplicit.values[i])], outExplicit.keys[i])
         }
     }
 }

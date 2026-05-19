@@ -60,7 +60,7 @@ public final class MetalRadixSortU64Pairs {
         /// scratch buffer of the given size. Typically out-of-memory.
         case bufferAllocationFailed(bytes: Int)
 
-        /// `count` passed to ``MetalRadixSortU64Pairs/encode(onto:keys:values:count:)``
+        /// `count` passed to ``MetalRadixSortU64Pairs/encode(onto:keys:values:count:beginBit:endBit:)``
         /// exceeded `maxElements` set at construction. The sorter cannot
         /// grow its scratch buffers after init.
         case countExceedsCapacity(count: Int, capacity: Int)
@@ -69,7 +69,7 @@ public final class MetalRadixSortU64Pairs {
     /// Pre-allocates scratch buffers and compiles pipeline state objects.
     ///
     /// All scratch allocations are sized for `maxElements`, so a subsequent
-    /// ``encode(onto:keys:values:count:)`` call with `count > maxElements`
+    /// ``encode(onto:keys:values:count:beginBit:endBit:)`` call with `count > maxElements`
     /// will fail a precondition. Call this once per device and reuse the
     /// instance.
     ///
@@ -109,6 +109,7 @@ public final class MetalRadixSortU64Pairs {
         psoMsdPrep     = try Self.makePSO(device: device, library: library, name: "sort_msd_prep",      fc: nil)
         psoMsdScatter  = try Self.makePSO(device: device, library: library, name: "sort_msd_atomic_scatter", fc: fc)
         psoInnerStable = try Self.makePSO(device: device, library: library, name: "sort_inner_stable_64", fc: fc)
+        psoCopyKeys    = try Self.makePSO(device: device, library: library, name: "sort_copy_keys_64",   fc: nil)
         psoInitIndices = try Self.makePSO(device: device, library: library, name: "sort_init_indices",  fc: nil)
         psoGather      = try Self.makePSO(device: device, library: library, name: "sort_gather_values", fc: nil)
 
@@ -140,23 +141,58 @@ public final class MetalRadixSortU64Pairs {
     /// ``init(device:maxElements:)``. `count` of 0 or 1 returns
     /// without encoding any work.
     ///
+    /// ## Bit-range hint
+    ///
+    /// `beginBit` and `endBit` mirror `cub::DeviceRadixSort::SortPairs`'s
+    /// hint: only bits `[beginBit, endBit)` of the key are considered
+    /// significant. Bits outside this range are treated as "don't care" —
+    /// the sort processes them anyway (to a byte boundary, see below), but
+    /// the caller takes responsibility for any ordering they produce. For
+    /// the gsplat `(cam_id | tile_id | depth)` use case, passing
+    /// `endBit = 32 + tile_n_bits + cam_n_bits` skips the unused high
+    /// bytes and gives a ~12-50% speedup depending on key density.
+    ///
+    /// Resolution is **byte-precise**, not bit-precise: the wrapper sorts
+    /// whole bytes covering `[beginBit, endBit)`, so e.g. `endBit = 50`
+    /// and `endBit = 56` dispatch identically (both touch byte 6 as the
+    /// MSD byte). Sorting a few extra "don't care" bits is free
+    /// correctness-wise.
+    ///
     /// - Parameters:
     ///   - encoder: A live `MTLComputeCommandEncoder`. The sort encodes
-    ///     ~13 dispatches; `endEncoding` is the caller's responsibility.
+    ///     up to ~13 dispatches; `endEncoding` is the caller's
+    ///     responsibility.
     ///   - keys: Input keys, sorted in place. The final byte pass writes
     ///     here.
     ///   - values: Input values, paired with `keys` by index. Sorted in
     ///     place to match the final key permutation.
     ///   - count: Number of valid pairs at the start of each buffer.
+    ///   - beginBit: Lowest bit considered significant. Default `0`.
+    ///     Rounded down to the nearest byte boundary.
+    ///   - endBit: One past the highest bit considered significant.
+    ///     Default `64`. Rounded up to the nearest byte boundary. Must
+    ///     satisfy `0 <= beginBit < endBit <= 64`.
     public func encode(
         onto encoder: MTLComputeCommandEncoder,
         keys: MTLBuffer,
         values: MTLBuffer,
-        count: Int
+        count: Int,
+        beginBit: Int = 0,
+        endBit: Int = 64
     ) {
         guard count > 1 else { return }
         precondition(count <= maxElements,
                      "count (\(count)) exceeds maxElements (\(maxElements))")
+        precondition(beginBit >= 0 && endBit <= 64 && beginBit < endBit,
+                     "invalid bit range: beginBit=\(beginBit), endBit=\(endBit) (require 0 <= beginBit < endBit <= 64)")
+
+        // Resolve [beginBit, endBit) to byte boundaries. msdByte is the
+        // highest byte that contains a relevant bit (used by the MSD
+        // scatter); firstByte is the lowest (used by the first inner LSD
+        // pass).
+        let msdByte    = (endBit - 1) / 8        // 0...7
+        let firstByte  = beginBit / 8            // 0...7, <= msdByte
+        let innerBytes = msdByte - firstByte     // number of LSD passes
 
         let n = UInt32(count)
         let numTiles = (count + TILE_SIZE_64 - 1) / TILE_SIZE_64
@@ -183,10 +219,10 @@ public final class MetalRadixSortU64Pairs {
         // gathered[i] = original[indices[i]] = values[i]  (indices is identity here)
         encodeGather(encoder, sortedIndices: valsA, original: values, gathered: valsOrig, count: n)
 
-        // Build SortParams for MSD pass (shift=56 = bits 56..63).
+        // Build SortParams for MSD pass on byte `msdByte`.
         var params = SortParams(element_count: n,
                                 num_tiles: UInt32(numTiles),
-                                shift: 56,
+                                shift: UInt32(msdByte * 8),
                                 pass: 0)
         var tileSizeU32: UInt32 = UInt32(TILE_SIZE_64)
 
@@ -220,39 +256,43 @@ public final class MetalRadixSortU64Pairs {
         encoder.setBuffer(valsB, offset: 0, index: 5)
         encoder.dispatchThreadgroups(histGrid, threadsPerThreadgroup: tgSize)
 
-        // Inner LSD passes (LSB → MSB within bucket): 7 single-byte dispatches
-        // of sort_inner_stable_64, one per byte 0..6. The lower 7 bytes are
-        // sorted here; byte 7 was the MSD pass.
-        //
-        // Ping-pong: after MSD scatter, keys are in bufB and values in valsB.
-        // The stable kernel reads from buffer(0) and writes to buffer(1).
-        // Byte 0: src=bufB, dst=bufA. Byte 1: src=bufA, dst=bufB. …
-        // Byte 6 (even-indexed pass, starting from 0) ends with data in bufA,
-        // which is the caller's keys buffer. ✓
-        let innerConfigs: [(UInt32, MTLBuffer, MTLBuffer, MTLBuffer, MTLBuffer)] = [
-            (0, bufB, bufA, valsB, valsA), // src,dst,src_vals,dst_vals
-            (1, bufA, bufB, valsA, valsB),
-            (2, bufB, bufA, valsB, valsA),
-            (3, bufA, bufB, valsA, valsB),
-            (4, bufB, bufA, valsB, valsA),
-            (5, bufA, bufB, valsA, valsB),
-            (6, bufB, bufA, valsB, valsA),
-        ]
-
-        for cfg in innerConfigs {
-            var ip = InnerParams(start_shift: cfg.0, pass_count: 1, batch_start: 0)
+        // Inner LSD passes over bytes [firstByte, msdByte). After MSD,
+        // keys are in bufB and values in valsB; the stable kernel reads
+        // buffer(0) and writes buffer(1). Pass index 0 reads bufB; each
+        // subsequent pass swaps. After N inner passes the data lives in
+        // bufA iff N is odd, bufB iff N is even.
+        for k in 0..<innerBytes {
+            let byte = UInt32(firstByte + k)
+            let readsFromB = (k % 2 == 0)
+            let srcK  = readsFromB ? bufB  : bufA
+            let dstK  = readsFromB ? bufA  : bufB
+            let srcV  = readsFromB ? valsB : valsA
+            let dstV  = readsFromB ? valsA : valsB
+            var ip = InnerParams(start_shift: byte, pass_count: 1, batch_start: 0)
             encoder.setComputePipelineState(psoInnerStable)
-            encoder.setBuffer(cfg.1,             offset: 0, index: 0) // src_keys
-            encoder.setBuffer(cfg.2,             offset: 0, index: 1) // dst_keys
-            encoder.setBuffer(bufBucketDescs,    offset: 0, index: 2)
+            encoder.setBuffer(srcK,           offset: 0, index: 0)
+            encoder.setBuffer(dstK,           offset: 0, index: 1)
+            encoder.setBuffer(bufBucketDescs, offset: 0, index: 2)
             encoder.setBytes(&ip, length: MemoryLayout<InnerParams>.size, index: 3)
-            encoder.setBuffer(cfg.3, offset: 0, index: 4) // src_vals
-            encoder.setBuffer(cfg.4, offset: 0, index: 5) // dst_vals
+            encoder.setBuffer(srcV, offset: 0, index: 4)
+            encoder.setBuffer(dstV, offset: 0, index: 5)
             encoder.dispatchThreadgroups(fusedGrid, threadsPerThreadgroup: tgSize)
         }
 
-        // Dispatch 8: final gather — caller.values[i] = valsOrig[valsA[i]]
-        encodeGather(encoder, sortedIndices: valsA, original: valsOrig, gathered: values, count: n)
+        // Parity reconciliation. After MSD + innerBytes inner passes:
+        // - keys are in bufA iff innerBytes is odd, else bufB.
+        // - values are in valsA iff innerBytes is odd, else valsB.
+        // Caller expects keys in bufA; copy if needed. For values, point
+        // the final gather at the buffer that actually holds the sorted
+        // permutation.
+        let keysInB = (innerBytes % 2 == 0)
+        let valsLive = keysInB ? valsB : valsA
+        if keysInB {
+            encodeCopyKeys(encoder, src: bufB, dst: bufA, count: n)
+        }
+
+        // Final gather: caller.values[i] = valsOrig[sortedIndices[i]].
+        encodeGather(encoder, sortedIndices: valsLive, original: valsOrig, gathered: values, count: n)
     }
 
     // MARK: - Private
@@ -264,6 +304,7 @@ public final class MetalRadixSortU64Pairs {
     private let psoMsdPrep: MTLComputePipelineState
     private let psoMsdScatter: MTLComputePipelineState
     private let psoInnerStable: MTLComputePipelineState
+    private let psoCopyKeys: MTLComputePipelineState
     private let psoInitIndices: MTLComputePipelineState
     private let psoGather: MTLComputePipelineState
 
@@ -307,6 +348,24 @@ public final class MetalRadixSortU64Pairs {
         encoder.setComputePipelineState(psoInitIndices)
         encoder.setBuffer(indices, offset: 0, index: 0)
         encoder.setBytes(&c, length: 4, index: 1)
+        let n = Int(count)
+        let tpg = THREADS_PER_TG
+        let grid = MTLSize(width: ((n + tpg - 1) / tpg) * tpg, height: 1, depth: 1)
+        let tgs  = MTLSize(width: tpg, height: 1, depth: 1)
+        encoder.dispatchThreads(grid, threadsPerThreadgroup: tgs)
+    }
+
+    private func encodeCopyKeys(
+        _ encoder: MTLComputeCommandEncoder,
+        src: MTLBuffer,
+        dst: MTLBuffer,
+        count: UInt32
+    ) {
+        var c = count
+        encoder.setComputePipelineState(psoCopyKeys)
+        encoder.setBuffer(src, offset: 0, index: 0)
+        encoder.setBuffer(dst, offset: 0, index: 1)
+        encoder.setBytes(&c, length: 4, index: 2)
         let n = Int(count)
         let tpg = THREADS_PER_TG
         let grid = MTLSize(width: ((n + tpg - 1) / tpg) * tpg, height: 1, depth: 1)

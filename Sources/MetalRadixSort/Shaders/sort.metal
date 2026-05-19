@@ -1037,6 +1037,27 @@ kernel void sort_inner_stable_64(
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// Kernel 4c: ulong key copy — dst[i] = src[i] for parity-driven landing
+//
+// The Swift wrapper alternates src/dst between bufA (caller's keys)
+// and bufB (scratch) for each byte pass. With seven inner passes the
+// final result lands back in bufA; with any other inner-pass count the
+// result ends up in scratch and needs to be copied. This kernel is
+// dispatched only when that parity mismatch occurs.
+//
+// Simple 1D dispatch: 1 thread per element.
+// ═══════════════════════════════════════════════════════════════════
+
+kernel void sort_copy_keys_64(
+    device const ulong* src   [[buffer(0)]],
+    device ulong*       dst   [[buffer(1)]],
+    constant uint&      count [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < count) dst[gid] = src[gid];
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // Kernel 5: Index Initializer — fill indices[i] = i for argsort
 //
 // Simple 1D dispatch: 1 thread per element.

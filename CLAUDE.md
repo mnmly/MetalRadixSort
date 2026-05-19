@@ -17,7 +17,7 @@ When you add or modify a `public` or `open` declaration:
 - Document each parameter with `- Parameter name:` (use the **internal**
   name when there's an external label — DocC warns otherwise).
 - Cross-reference related symbols with double-backtick links, e.g.
-  `` ``MetalRadixSortU64Pairs/encode(onto:keys:values:count:)`` ``.
+  `` ``MetalRadixSortU64Pairs/encode(onto:keys:values:count:beginBit:endBit:)`` ``.
   DocC link syntax is signature-sensitive: `foo(_:)` and `foo(_:_:)` are
   different.
 - When you add a new top-level symbol that belongs in the curated
