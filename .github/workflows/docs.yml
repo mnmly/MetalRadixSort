@@ -1,0 +1,78 @@
+# Builds the DocC site on push to main and deploys to GitHub Pages.
+#
+# Repo settings → Pages → Source must be "GitHub Actions" (not "Deploy
+# from a branch") for this workflow to publish anything.
+#
+# Site URL: https://mnmly.github.io/MetalRadixSort/
+# Per-target docs land at: …/MetalRadixSort/documentation/metalradixsort/
+# A root-level redirect (generated below) bounces visitors there.
+
+name: Build and deploy DocC
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Cancel any in-flight Pages deploy if a newer push arrives — we only
+# care about shipping the latest main.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-15
+    env:
+      TARGETS: MetalRadixSort
+      HOSTING_BASE_PATH: MetalRadixSort
+      REPO_URL: https://github.com/mnmly/MetalRadixSort
+      REPO_BRANCH: main
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        # macos-15 default Xcode covers Swift 6 (required by Package.swift's
+        # swift-tools-version: 6.0). Pin explicitly to guard against
+        # runner-image drift breaking the build silently.
+        run: sudo xcode-select -s /Applications/Xcode_16.app || sudo xcode-select -s /Applications/Xcode.app
+
+      - name: Build DocC site
+        run: ./Scripts/build_docs.sh
+
+      - name: Write root-level redirect
+        # build_docs.sh writes per-target subdirs (docs/<Target>/...). A
+        # plain `docs/index.html` makes the Pages root URL land users on
+        # the actual reference docs instead of a 404.
+        run: |
+          cat > docs/index.html <<'HTML'
+          <!doctype html>
+          <meta charset="utf-8">
+          <title>MetalRadixSort — DocC</title>
+          <meta http-equiv="refresh"
+                content="0; url=./MetalRadixSort/documentation/metalradixsort/">
+          <link rel="canonical"
+                href="./MetalRadixSort/documentation/metalradixsort/">
+          <p>Redirecting to
+            <a href="./MetalRadixSort/documentation/metalradixsort/">the docs</a>…
+          </p>
+          HTML
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
