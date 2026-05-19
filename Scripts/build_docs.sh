@@ -93,8 +93,8 @@ for TARGET in $TARGETS; do
         --disable-indexing \
         --transform-for-static-hosting \
         --hosting-base-path "${HOSTING_BASE_PATH}/${TARGET}" \
-        "${SOURCE_FLAGS[@]}" \
-        "${EXTRA_FLAGS[@]}"
+        ${SOURCE_FLAGS[@]+"${SOURCE_FLAGS[@]}"} \
+        ${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"}
 done
 
 if [[ "${EMIT_LLMS_TXT:-0}" == "1" ]]; then
