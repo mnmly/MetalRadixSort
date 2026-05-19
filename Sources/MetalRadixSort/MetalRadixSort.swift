@@ -15,11 +15,13 @@ import Metal
 ///
 /// ## Algorithm
 ///
-/// One MSD scatter on byte 7 distributes elements into 256 buckets, then
-/// seven LSD passes on bytes 0..6 (LSB first) sort each bucket in place via
-/// the `sort_inner_stable_64` kernel — a deterministic split-and-flag
-/// bit-sort in threadgroup memory. The whole pipeline (init, MSD trio,
-/// 7 inner passes, value gather) runs in a single compute encoder.
+/// One MSD scatter on byte 7 distributes elements into 256 buckets via the
+/// `sort_msd_stable_scatter` kernel — a deterministic split-and-flag
+/// bit-sort within each tile plus a pre-scanned per-(tile, digit) offset
+/// table from `sort_msd_prep`. Seven LSD passes on bytes 0..6 then finish
+/// each bucket in place via `sort_inner_stable_64`, using the same
+/// bit-split technique. The whole pipeline (init, MSD trio, 7 inner
+/// passes, value gather) runs in a single compute encoder.
 ///
 /// Value pairing follows the "argsort + gather" idiom: an internal index
 /// buffer is permuted alongside the keys, then used at the end to gather
@@ -27,11 +29,11 @@ import Metal
 ///
 /// ## Stability
 ///
-/// Keys come out in monotonic non-decreasing order, but equal-key
-/// sub-orderings are **not** stable — the MSD scatter uses racing atomics
-/// for within-bucket rank assignment. Callers who need a stable result can
-/// pack the original input index into spare low bits of the key to break
-/// ties deterministically; see the `STATUS.md` "Future work" section.
+/// The sort is **stable**: equal-key elements come out in their original
+/// input order. Every rank computation along the pipeline is
+/// deterministic — the MSD scatter uses pre-scanned offsets per
+/// (tile, digit) plus an in-tile bit-split sort, and each inner LSD pass
+/// uses the same bit-split. No racing atomics on element ranks anywhere.
 public final class MetalRadixSortU64Pairs {
 
     // MARK: - Public API
@@ -107,22 +109,28 @@ public final class MetalRadixSortU64Pairs {
 
         psoMsdHist     = try Self.makePSO(device: device, library: library, name: "sort_msd_histogram", fc: fc)
         psoMsdPrep     = try Self.makePSO(device: device, library: library, name: "sort_msd_prep",      fc: nil)
-        psoMsdScatter  = try Self.makePSO(device: device, library: library, name: "sort_msd_atomic_scatter", fc: fc)
+        psoMsdStable   = try Self.makePSO(device: device, library: library, name: "sort_msd_stable_scatter", fc: fc)
         psoInnerStable = try Self.makePSO(device: device, library: library, name: "sort_inner_stable_64", fc: fc)
         psoCopyKeys    = try Self.makePSO(device: device, library: library, name: "sort_copy_keys_64",   fc: nil)
         psoInitIndices = try Self.makePSO(device: device, library: library, name: "sort_init_indices",  fc: nil)
         psoGather      = try Self.makePSO(device: device, library: library, name: "sort_gather_values", fc: nil)
 
-        // 3. Allocate scratch buffers.
-        let keyBytes  = self.maxElements * MemoryLayout<UInt64>.stride
-        let valBytes  = self.maxElements * MemoryLayout<UInt32>.stride
+        // 3. Allocate scratch buffers. `bufTileHists` and `bufTileOffsets`
+        // hold the per-(tile,digit) data the stable MSD scatter consumes;
+        // they're sized for the worst-case tile count.
+        let keyBytes      = self.maxElements * MemoryLayout<UInt64>.stride
+        let valBytes      = self.maxElements * MemoryLayout<UInt32>.stride
+        let maxNumTiles   = (self.maxElements + Self.tileSize64 - 1) / Self.tileSize64
+        self.maxNumTiles  = maxNumTiles
+        let perTileBytes  = max(maxNumTiles, 1) * 256 * MemoryLayout<UInt32>.stride
 
         bufKeyScratch    = try Self.makeBuffer(device: device, length: keyBytes)
         bufValsA         = try Self.makeBuffer(device: device, length: valBytes)
         bufValsB         = try Self.makeBuffer(device: device, length: valBytes)
         bufValsOrig      = try Self.makeBuffer(device: device, length: valBytes)
         bufMsdHist       = try Self.makeBuffer(device: device, length: 256 * MemoryLayout<UInt32>.stride)
-        bufCounters      = try Self.makeBuffer(device: device, length: 256 * MemoryLayout<UInt32>.stride)
+        bufTileHists     = try Self.makeBuffer(device: device, length: perTileBytes)
+        bufTileOffsets   = try Self.makeBuffer(device: device, length: perTileBytes)
         bufBucketDescs   = try Self.makeBuffer(device: device, length: 256 * MemoryLayout<BucketDesc>.stride)
     }
 
@@ -231,26 +239,39 @@ public final class MetalRadixSortU64Pairs {
         let oneGrid  = MTLSize(width: 1, height: 1, depth: 1)
         let fusedGrid = MTLSize(width: 256, height: 1, depth: 1)
 
-        // Dispatch 2: sort_msd_histogram
+        // Dispatch 2: sort_msd_histogram — emits both the global digit
+        // histogram (atomic-summed across tiles) and the per-tile
+        // histograms (direct writes) that the next two dispatches
+        // consume.
         encoder.setComputePipelineState(psoMsdHist)
-        encoder.setBuffer(bufA,        offset: 0, index: 0)
-        encoder.setBuffer(bufMsdHist,  offset: 0, index: 1)
+        encoder.setBuffer(bufA,         offset: 0, index: 0)
+        encoder.setBuffer(bufMsdHist,   offset: 0, index: 1)
         encoder.setBytes(&params, length: MemoryLayout<SortParams>.size, index: 2)
+        encoder.setBuffer(bufTileHists, offset: 0, index: 3)
         encoder.dispatchThreadgroups(histGrid, threadsPerThreadgroup: tgSize)
 
-        // Dispatch 3: sort_msd_prep (1 TG)
+        // Dispatch 3: sort_msd_prep (1 TG) — derives bucket_descs and
+        // tile_offsets[num_tiles * 256] from the histograms. Each
+        // thread runs the per-digit cross-tile prefix scan, so the
+        // stable scatter has deterministic start slots per (tile, digit).
+        var numTilesU32: UInt32 = UInt32(numTiles)
         encoder.setComputePipelineState(psoMsdPrep)
         encoder.setBuffer(bufMsdHist,     offset: 0, index: 0)
-        encoder.setBuffer(bufCounters,    offset: 0, index: 1)
+        encoder.setBuffer(bufTileHists,   offset: 0, index: 1)
         encoder.setBuffer(bufBucketDescs, offset: 0, index: 2)
         encoder.setBytes(&tileSizeU32, length: 4, index: 3)
+        encoder.setBytes(&numTilesU32, length: 4, index: 4)
+        encoder.setBuffer(bufTileOffsets, offset: 0, index: 5)
         encoder.dispatchThreadgroups(oneGrid, threadsPerThreadgroup: tgSize)
 
-        // Dispatch 4: sort_msd_atomic_scatter (bufA → bufB, valsA → valsB)
-        encoder.setComputePipelineState(psoMsdScatter)
-        encoder.setBuffer(bufA,         offset: 0, index: 0)
-        encoder.setBuffer(bufB,         offset: 0, index: 1)
-        encoder.setBuffer(bufCounters,  offset: 0, index: 2)
+        // Dispatch 4: sort_msd_stable_scatter (bufA → bufB, valsA → valsB).
+        // Replaces the racing-atomic scatter — uses pre-scanned
+        // tile_offsets for cross-tile placement and a bit-split sort for
+        // within-tile rank, so equal-key ordering is deterministic.
+        encoder.setComputePipelineState(psoMsdStable)
+        encoder.setBuffer(bufA,           offset: 0, index: 0)
+        encoder.setBuffer(bufB,           offset: 0, index: 1)
+        encoder.setBuffer(bufTileOffsets, offset: 0, index: 2)
         encoder.setBytes(&params, length: MemoryLayout<SortParams>.size, index: 3)
         encoder.setBuffer(valsA, offset: 0, index: 4)
         encoder.setBuffer(valsB, offset: 0, index: 5)
@@ -302,7 +323,7 @@ public final class MetalRadixSortU64Pairs {
 
     private let psoMsdHist: MTLComputePipelineState
     private let psoMsdPrep: MTLComputePipelineState
-    private let psoMsdScatter: MTLComputePipelineState
+    private let psoMsdStable: MTLComputePipelineState
     private let psoInnerStable: MTLComputePipelineState
     private let psoCopyKeys: MTLComputePipelineState
     private let psoInitIndices: MTLComputePipelineState
@@ -313,10 +334,13 @@ public final class MetalRadixSortU64Pairs {
     private let bufValsB: MTLBuffer
     private let bufValsOrig: MTLBuffer
     private let bufMsdHist: MTLBuffer
-    private let bufCounters: MTLBuffer
+    private let bufTileHists: MTLBuffer
+    private let bufTileOffsets: MTLBuffer
     private let bufBucketDescs: MTLBuffer
+    private let maxNumTiles: Int
 
     // Constants mirrored from sort.metal:
+    private static let tileSize64 = 2048
     private let TILE_SIZE_64 = 2048
     private let THREADS_PER_TG = 256
 

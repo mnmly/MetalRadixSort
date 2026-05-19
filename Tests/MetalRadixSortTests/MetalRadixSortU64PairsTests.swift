@@ -330,6 +330,78 @@ final class MetalRadixSortU64PairsTests: XCTestCase {
         assertSortedPaired(inputKeys: keys, outKeys: out.keys, outVals: out.values)
     }
 
+    // MARK: - Stability
+
+    /// Asserts the sort is stable: equal-key runs preserve the input
+    /// index order through `outVals`. Stronger than ``assertSortedPaired``.
+    private func assertStable(
+        inputKeys: [UInt64],
+        outKeys: [UInt64],
+        outVals: [UInt32]
+    ) {
+        let n = inputKeys.count
+        let refIndices: [UInt32] = (0..<UInt32(n)).sorted { a, b in
+            inputKeys[Int(a)] < inputKeys[Int(b)]
+        }
+        let refKeys: [UInt64] = refIndices.map { inputKeys[Int($0)] }
+        XCTAssertEqual(outKeys, refKeys, "GPU keys differ from CPU stable reference")
+        // Equal-key blocks: outVals on the GPU must match refIndices
+        // from the CPU stable sort — exact equality, not just permutation.
+        XCTAssertEqual(outVals, refIndices,
+                       "GPU sort is not stable — outVals diverge from CPU stable indices")
+    }
+
+    /// Synthetic duplicates: 256 distinct keys, each repeated 100 times,
+    /// shuffled. Stable sort must produce blocks of 100 in input-index
+    /// order.
+    func testStableEqualKeys() throws {
+        let device = try makeDevice()
+        let n = 25_600
+        let sorter = try MetalRadixSortU64Pairs(device: device, maxElements: n)
+        var rng = SystemRandomNumberGenerator()
+        // Build [k for k in 0..256 repeated 100 times] then shuffle.
+        var keys: [UInt64] = []
+        keys.reserveCapacity(n)
+        for k in 0..<256 { for _ in 0..<100 { keys.append(UInt64(k)) } }
+        keys.shuffle(using: &rng)
+        let out = try runSort(keys: keys, device: device, sorter: sorter)
+        assertStable(inputKeys: keys, outKeys: out.keys, outVals: out.values)
+    }
+
+    /// 1M elements with ~10% deliberate duplicates (key mod 1024 has high
+    /// collision density). Catches cross-tile stability bugs that small
+    /// inputs don't exercise.
+    func testStable1MWithDupes() throws {
+        let device = try makeDevice()
+        let n = 1_000_000
+        let sorter = try MetalRadixSortU64Pairs(device: device, maxElements: n)
+        var rng = SystemRandomNumberGenerator()
+        let keys: [UInt64] = (0..<n).map { _ in
+            UInt64.random(in: 0...UInt64.max, using: &rng) & 0x3FF  // 1024 distinct values
+        }
+        let out = try runSort(keys: keys, device: device, sorter: sorter)
+        assertStable(inputKeys: keys, outKeys: out.keys, outVals: out.values)
+    }
+
+    /// Stability under the bit-range hint: high bits are random so the
+    /// MSD scatter does meaningful work, low bits collide so equal-key
+    /// blocks are large. With `endBit=50` and the kept-stable scatter,
+    /// equal-key order should follow input index.
+    func testStableWithBitRangeHint() throws {
+        let device = try makeDevice()
+        let n = 50_000
+        let sorter = try MetalRadixSortU64Pairs(device: device, maxElements: n)
+        var rng = SystemRandomNumberGenerator()
+        let mask: UInt64 = (1 << 50) - 1
+        // Keys with byte 0 forced to 0 and bits 50..63 zero — guarantees
+        // many equal-key blocks while staying within the endBit=50 range.
+        let keys: [UInt64] = (0..<n).map { _ in
+            (UInt64.random(in: 0...UInt64.max, using: &rng) & mask) & ~UInt64(0xFF)
+        }
+        let out = try runSort(keys: keys, device: device, sorter: sorter, endBit: 50)
+        assertStable(inputKeys: keys, outKeys: out.keys, outVals: out.values)
+    }
+
     /// `endBit=64` explicit must match the default-arg call exactly on
     /// keys + value-tracking. Guards against the default path drifting.
     func testEndBit64MatchesDefault() throws {

@@ -1,7 +1,8 @@
 # MetalRadixSort — Status
 
-**As of 2026-05-19: working.** 1M u64-pair sort in ~3.5 ms on Apple M5 Max.
-All probe and edge-case tests pass with zero monotonicity failures.
+**As of 2026-05-19: working and stable.** 1M u64-pair sort in ~4.1 ms on
+Apple M5 Max with full stability across equal keys. All probe, edge-case,
+and stability tests pass.
 
 ## What works
 
@@ -67,36 +68,37 @@ test signal was `testEdgeCases`' "3000 equal keys" case producing zeros in
 the first ~2048 positions (sub-tile 1 wrote padding zeros over sub-tile 0's
 real writes).
 
-## Future work (queued)
-
-A deliberate omission, not a bug. Document the workaround on the caller
-side until/unless we invest in the kernel work.
+## Done since 0.1.0
 
 ### Stability across equal keys
 
-The current sort is monotonic on keys but not stable across equal keys.
-The MSD scatter (`sort_msd_atomic_scatter`) uses a racing
-`atomic_fetch_add` for both cross-TG `tile_base[d]` assignment and within-SG
-`within_sg` rank assignment, so two elements with the same MSD digit can
-swap positions non-deterministically.
+The sort is now stable. The MSD scatter (`sort_msd_stable_scatter`)
+replaces the old racing-atomic kernel with deterministic ordering on both
+axes:
 
-**Caller workaround**: pack the original input index into the low bits of
-the key so no two elements share a key. For gsplat the natural key
-`(cam_id | tile_id | depth)` typically uses ~50 of 64 bits — the remaining
-~14-20 bits cheaply hold `log2(n)` of tiebreaker. Same trick CUB users use
-when they want determinism without depending on CUB's stability contract.
+- **Cross-tile**: `sort_msd_prep` writes a per-(tile, digit) offset table
+  (`tile_offsets[t*256+d] = bkt_pfx[d] + sum_of_tile_hists[0..t-1][d]`).
+  Every TG knows its exact destination slots before scatter — no atomic
+  fetch on a global counter.
+- **Within-tile**: each TG runs the same 9-bit split-and-flag sort the
+  inner kernel uses (8 digit bits + 1 padding sentinel), then scatters
+  each element to `tile_offsets[gid*256+d] + (sorted_pos - tile_pfx[d])`.
+  Deterministic rank within the tile.
 
-**Kernel-side fix (when it's worth it)**: replace the MSD scatter with
-deterministic cross-TG and within-TG ordering:
-1. Per-TG histogram → global prefix scan across tiles (one extra dispatch)
-   gives each TG a stable `tile_base[d]` instead of an atomic-counter slot.
-2. Replace Phase 4's racing atomic with the same `sort_inner_stable_64`
-   bit-split technique (one TG, 8 bit passes on the digit).
+The inner LSD passes (`sort_inner_stable_64`) were already stable; chained
+with the new stable scatter, the whole pipeline preserves input-index
+order across equal-key blocks.
 
-Estimated ~1-2 days, ~10-15% perf cost. The same architecture pattern as
-NVIDIA Onesweep, minus the chained-lookback.
+Perf cost: ~10-15% (1M sort ~3.5 ms → ~4.1 ms on M5 Max). The cost is
+roughly the per-tile bit-split replacing the racing atomic, plus the
+extra device-memory traffic for the `tile_hists` / `tile_offsets` buffers
+(~512 KB each at maxElements = 1M).
 
-## Done since 0.1.0
+Tests: `testStableEqualKeys` (256 distinct × 100 copies, shuffled),
+`testStable1MWithDupes` (1M elements / 1024 distinct values),
+`testStableWithBitRangeHint` (50K with `endBit = 50`). All assert exact
+match with the CPU stable sort's value permutation, not just key
+monotonicity.
 
 ### Bit-range hint (`beginBit` / `endBit`)
 

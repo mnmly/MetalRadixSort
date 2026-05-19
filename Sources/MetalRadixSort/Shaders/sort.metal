@@ -69,6 +69,7 @@ kernel void sort_msd_histogram(
     device const uint*     src          [[buffer(0)]],
     device atomic_uint*    global_hist  [[buffer(1)]],
     constant SortParams&   params       [[buffer(2)]],
+    device uint*           tile_hists   [[buffer(3)]],
     uint lid [[thread_position_in_threadgroup]],
     uint gid [[threadgroup_position_in_grid]],
     uint simd_id   [[simdgroup_index_in_threadgroup]],
@@ -138,6 +139,9 @@ kernel void sort_msd_histogram(
                 &sg_counts[sg * SORT_NUM_BINS + lid],
                 memory_order_relaxed);
         }
+        // Emit the per-tile histogram so a downstream prep kernel can
+        // compute deterministic cross-tile offsets without atomics.
+        tile_hists[gid * SORT_NUM_BINS + lid] = total;
         if (total > 0u) {
             atomic_fetch_add_explicit(&global_hist[lid],
                                       total, memory_order_relaxed);
@@ -150,20 +154,23 @@ kernel void sort_msd_histogram(
 //
 // Single dispatch, 1 TG, 256 threads.
 // Input:  global_hist[256] = per-digit counts
-// Output: counters[256]    = exclusive prefix (for atomic scatter)
-//         bucket_descs[256] = offset/count/tile_count for inner sort
+// Output: bucket_descs[256] = offset/count/tile_count for inner sort
+//         tile_offsets[num_tiles * 256] = per-(tile,digit) absolute output
+//             position for the stable scatter. tile_offsets[t*256+d] =
+//             bkt_pfx[d] + sum_of_tile_hists[0..t-1][d].
 // ═══════════════════════════════════════════════════════════════════
 
 kernel void sort_msd_prep(
     device const uint*     global_hist  [[buffer(0)]],
-    device uint*           counters     [[buffer(1)]],
+    device const uint*     tile_hists   [[buffer(1)]],
     device BucketDesc*     bucket_descs [[buffer(2)]],
     constant uint&         tile_size    [[buffer(3)]],
+    constant uint&         num_tiles    [[buffer(4)]],
+    device uint*           tile_offsets [[buffer(5)]],
     uint lid [[thread_position_in_threadgroup]])
 {
-    // Thread 0 does serial prefix sum (256 values — trivial)
+    // Thread 0 does serial prefix sum across the 256 digit bins.
     threadgroup uint prefix[SORT_NUM_BINS];
-    threadgroup uint running_offset;
 
     if (lid == 0u) {
         uint sum = 0u;
@@ -171,201 +178,208 @@ kernel void sort_msd_prep(
             prefix[i] = sum;
             sum += global_hist[i];
         }
-        running_offset = sum;  // total element count (sanity)
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // All 256 threads write counters and bucket_descs in parallel
-    uint count = global_hist[lid];
+    // Each thread emits one bucket_desc and runs the cross-tile scan for
+    // its assigned digit. The scan gives every tile its exact start slot
+    // for digit `lid`, no atomics required during scatter.
+    uint count  = global_hist[lid];
     uint offset = prefix[lid];
-    counters[lid] = offset;  // non-atomic write (used as initial value)
 
     uint tc = (count + tile_size - 1u) / tile_size;
     bucket_descs[lid] = BucketDesc{offset, count, tc, 0u};
+
+    // tile_offsets[t * 256 + lid] = offset + sum_{t' < t} tile_hists[t'][lid]
+    uint running = 0u;
+    for (uint t = 0u; t < num_tiles; t++) {
+        tile_offsets[t * SORT_NUM_BINS + lid] = offset + running;
+        running += tile_hists[t * SORT_NUM_BINS + lid];
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// Kernel 3: Atomic MSD Scatter — replaces decoupled lookback
+// Kernel 3: Stable MSD Scatter — bit-split per tile + pre-scanned offsets
 //
-// Uses atomic_fetch_add on global counters initialized to
-// exclusive_prefix[d]. Each tile's atomic returns its exact
-// global position — zero spin-waiting.
+// Replaces the legacy `sort_msd_atomic_scatter`. The old kernel was
+// unstable on two axes: tiles raced for `counters[d]` slots
+// (cross-tile non-determinism) and lanes within an SG raced for
+// `sg_hist_or_rank[sg*256+d]` slots (within-tile non-determinism). This
+// kernel removes both races:
 //
-// TG Memory: 18 KB
+//   - Cross-tile: `tile_offsets[gid * 256 + d]` is precomputed by
+//     `sort_msd_prep` (deterministic per-digit prefix scan across
+//     tiles). Every TG knows its exact start slot for each digit before
+//     scatter — no atomic on a global counter.
+//
+//   - Within-tile: the per-element rank within a digit is computed by
+//     the same split-and-flag bit-sort the inner kernel uses (9 bit
+//     passes: bits 0..7 of the digit + bit 8 = padding sentinel for the
+//     partial last tile). The post-sort position minus the per-tile
+//     digit prefix is the deterministic rank.
+//
+// Output for an element at tile-local position `orig` with digit `d`:
+//   dst[tile_offsets[gid * 256 + d] + (sorted_pos - tile_pfx[d])]
+//     = src[base + orig]
+//
+// TG memory: ~20 KB (tg_dig 2KB + tg_idx_a 8KB + tg_idx_b 8KB
+//                    + tile_hist_at 1KB + tile_pfx 1KB + scratch).
 // ═══════════════════════════════════════════════════════════════════
 
-kernel void sort_msd_atomic_scatter(
-    device const uint*     src       [[buffer(0)]],
-    device uint*           dst       [[buffer(1)]],
-    device atomic_uint*    counters  [[buffer(2)]],
-    constant SortParams&   params    [[buffer(3)]],
-    device const uint*     src_vals  [[buffer(4)]],
-    device uint*           dst_vals  [[buffer(5)]],
-    uint lid [[thread_position_in_threadgroup]],
-    uint gid [[threadgroup_position_in_grid]],
+kernel void sort_msd_stable_scatter(
+    device const ulong*       src_keys     [[buffer(0)]],
+    device ulong*             dst_keys     [[buffer(1)]],
+    device const uint*        tile_offsets [[buffer(2)]],
+    constant SortParams&      params       [[buffer(3)]],
+    device const uint*        src_vals     [[buffer(4)]],
+    device uint*              dst_vals     [[buffer(5)]],
+    uint lid       [[thread_position_in_threadgroup]],
+    uint gid       [[threadgroup_position_in_grid]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_id   [[simdgroup_index_in_threadgroup]])
 {
-    uint n     = params.element_count;
-    uint shift = params.shift;
+    constexpr uint TILE     = SORT_TILE_64;
+    constexpr uint ELEMS    = TILE / SORT_THREADS;       // 8
+    constexpr uint SG_SIZE  = 32u;
+    constexpr uint NUM_SGS  = SORT_THREADS / SG_SIZE;    // 8
 
-    // ── TG Memory (18 KB) ────────────────────────────────────────
-    threadgroup atomic_uint sg_hist_or_rank[SORT_NUM_SGS * SORT_NUM_BINS]; // 8 KB
-    threadgroup uint sg_prefix[SORT_NUM_SGS * SORT_NUM_BINS];             // 8 KB
-    threadgroup uint tile_hist[SORT_NUM_BINS];                              // 1 KB
-    threadgroup uint tile_base[SORT_NUM_BINS];                              // 1 KB
+    uint n          = params.element_count;
+    uint shift      = params.shift;
+    uint base       = gid * TILE;
+    uint tile_valid = (base >= n) ? 0u : min(TILE, n - base);
 
-    // ── Phase 2: Per-SG atomic histogram (zero first) ────────────
-    for (uint i = lid; i < SORT_NUM_SGS * SORT_NUM_BINS; i += SORT_THREADS) {
-        atomic_store_explicit(&sg_hist_or_rank[i], 0u, memory_order_relaxed);
+    if (tile_valid == 0u) return;
+
+    threadgroup uchar       tg_dig[TILE];
+    threadgroup uint        tg_idx_a[TILE];
+    threadgroup uint        tg_idx_b[TILE];
+    threadgroup atomic_uint tile_hist_at[SORT_NUM_BINS];
+    threadgroup uint        tile_pfx[SORT_NUM_BINS];
+    threadgroup uint        sg_partials[NUM_SGS];
+    threadgroup uint        total_ones_tg;
+
+    // ── Phase 1: cache digits, init identity permutation ──
+    for (uint e = 0u; e < ELEMS; e++) {
+        uint i = lid * ELEMS + e;
+        uchar d = 0;
+        if (i < tile_valid) {
+            ulong k = src_keys[base + i];
+            d = (uchar)((k >> shift) & 0xFFu);
+        }
+        tg_dig[i] = d;
+        tg_idx_a[i] = i;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    if (is_64bit) {
-        // ═══ 64-bit path: 8 elements/thread, 2048-element tiles ═══
-        uint base = gid * SORT_TILE_64;
-        device const ulong* src64 = reinterpret_cast<device const ulong*>(src);
-        device ulong* dst64 = reinterpret_cast<device ulong*>(dst);
+    // ── Phase 2: 9 bit passes — split-and-flag stable sort ──
+    // Bits 0..7 are the digit, bit 8 is the padding sentinel. Real
+    // elements have key9 = digit (bit 8 = 0); padding has key9 = 0x100
+    // (bit 8 = 1). After 9 passes, real elements are sorted by digit
+    // and padding has been pushed to the upper [tile_valid, TILE) slots.
+    for (uint b = 0u; b < 9u; b++) {
+        threadgroup uint* read_idx  = ((b & 1u) == 0u) ? tg_idx_a : tg_idx_b;
+        threadgroup uint* write_idx = ((b & 1u) == 0u) ? tg_idx_b : tg_idx_a;
 
-        // ── Phase 1: Load 8 ulong elements ───────────────────────
-        ulong mk64[SORT_ELEMS_64];
-        uint md[SORT_ELEMS_64];
-        bool mv[SORT_ELEMS_64];
-        uint mv_vals[SORT_ELEMS_64];
-        for (uint e = 0u; e < SORT_ELEMS_64; e++) {
-            uint idx = base + e * SORT_THREADS + lid;
-            mv[e] = idx < n;
-            mk64[e] = mv[e] ? src64[idx] : 0xFFFFFFFFFFFFFFFFul;
-            md[e] = mv[e] ? (uint)((mk64[e] >> shift) & 0xFFu) : 0xFFu;
+        uint flags[ELEMS];
+        uint thread_total = 0u;
+        for (uint e = 0u; e < ELEMS; e++) {
+            uint i   = lid * ELEMS + e;
+            uint cur = read_idx[i];
+            uint dig = (uint)tg_dig[cur];
+            // is_padding follows the element, not the slot — same fix
+            // as in sort_inner_stable_64 (real elements moved into slots
+            // i >= tile_valid in later passes would otherwise look like
+            // padding).
+            bool is_padding = cur >= tile_valid;
+            uint key9 = is_padding ? 0x100u : dig;
+            uint bit  = (key9 >> b) & 1u;
+            flags[e] = bit;
+            thread_total += bit;
+        }
+
+        // Two-level exclusive prefix scan over TILE flags.
+        uint sg_excl = simd_prefix_exclusive_sum(thread_total);
+        if (simd_lane == SG_SIZE - 1u) {
+            sg_partials[simd_id] = sg_excl + thread_total;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lid == 0u) {
+            uint running = 0u;
+            for (uint c = 0u; c < NUM_SGS; c++) {
+                uint cv = sg_partials[c];
+                sg_partials[c] = running;
+                running += cv;
+            }
+            total_ones_tg = running;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint thread_base = sg_partials[simd_id] + sg_excl;
+        uint total_ones  = total_ones_tg;
+        uint total_zeros = TILE - total_ones;
+
+        uint running = 0u;
+        for (uint e = 0u; e < ELEMS; e++) {
+            uint i = lid * ELEMS + e;
+            uint elem_pfx = thread_base + running;
+            uint new_pos = (flags[e] != 0u)
+                ? (total_zeros + elem_pfx)
+                : (i - elem_pfx);
+            running += flags[e];
+            write_idx[new_pos] = read_idx[i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    // After 9 passes (b=8 even), final permutation lives in tg_idx_b.
+
+    // ── Phase 3: per-tile histogram + exclusive prefix ──
+    atomic_store_explicit(&tile_hist_at[lid], 0u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint e = 0u; e < ELEMS; e++) {
+        uint i = lid * ELEMS + e;
+        if (i < tile_valid) {
+            uint orig = tg_idx_b[i];
+            uint d = (uint)tg_dig[orig];
+            atomic_fetch_add_explicit(&tile_hist_at[d], 1u,
+                                      memory_order_relaxed);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    {
+        uint v = atomic_load_explicit(&tile_hist_at[lid], memory_order_relaxed);
+        uint sg_excl = simd_prefix_exclusive_sum(v);
+        if (simd_lane == SG_SIZE - 1u) sg_partials[simd_id] = sg_excl + v;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lid == 0u) {
+            uint running = 0u;
+            for (uint c = 0u; c < NUM_SGS; c++) {
+                uint cv = sg_partials[c];
+                sg_partials[c] = running;
+                running += cv;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        tile_pfx[lid] = sg_excl + sg_partials[simd_id];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ── Phase 4: scatter to global dst using pre-scanned offsets ──
+    for (uint e = 0u; e < ELEMS; e++) {
+        uint i = lid * ELEMS + e;
+        if (i < tile_valid) {
+            uint orig = tg_idx_b[i];
+            uint d = (uint)tg_dig[orig];
+            uint dst_idx = tile_offsets[gid * SORT_NUM_BINS + d]
+                         + (i - tile_pfx[d]);
+            dst_keys[dst_idx] = src_keys[base + orig];
             if (has_values) {
-                mv_vals[e] = mv[e] ? src_vals[idx] : 0u;
-            }
-        }
-
-        // ── Phase 2: Per-SG atomic histogram ─────────────────────
-        for (uint e = 0u; e < SORT_ELEMS_64; e++) {
-            if (mv[e]) {
-                atomic_fetch_add_explicit(
-                    &sg_hist_or_rank[simd_id * SORT_NUM_BINS + md[e]],
-                    1u, memory_order_relaxed);
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // ── Phase 2b: Tile histogram + cross-SG prefix ───────────
-        {
-            uint total = 0u;
-            for (uint sg = 0u; sg < SORT_NUM_SGS; sg++) {
-                uint c = atomic_load_explicit(
-                    &sg_hist_or_rank[sg * SORT_NUM_BINS + lid],
-                    memory_order_relaxed);
-                sg_prefix[sg * SORT_NUM_BINS + lid] = total;
-                total += c;
-            }
-            tile_hist[lid] = total;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // ── Phase 3: Atomic fetch-add on global counters ─────────
-        {
-            tile_base[lid] = atomic_fetch_add_explicit(
-                &counters[lid], tile_hist[lid], memory_order_relaxed);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // ── Phase 4: Per-SG ranking + scatter ────────────────────
-        for (uint i = lid; i < SORT_NUM_SGS * SORT_NUM_BINS; i += SORT_THREADS) {
-            atomic_store_explicit(&sg_hist_or_rank[i], 0u, memory_order_relaxed);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (uint e = 0u; e < SORT_ELEMS_64; e++) {
-            if (mv[e]) {
-                uint d = md[e];
-                uint within_sg = atomic_fetch_add_explicit(
-                    &sg_hist_or_rank[simd_id * SORT_NUM_BINS + d],
-                    1u, memory_order_relaxed);
-                uint gp = tile_base[d]
-                         + sg_prefix[simd_id * SORT_NUM_BINS + d]
-                         + within_sg;
-                dst64[gp] = mk64[e];
-                if (has_values) {
-                    dst_vals[gp] = mv_vals[e];
-                }
-            }
-        }
-    } else {
-        // ═══ 32-bit path: 16 elements/thread, 4096-element tiles ═══
-        uint base = gid * SORT_TILE_SIZE;
-
-        // ── Phase 1: Load 16 elements ────────────────────────────
-        uint mk[SORT_ELEMS];
-        uint md[SORT_ELEMS];
-        bool mv[SORT_ELEMS];
-        uint mv_vals[SORT_ELEMS];
-        for (uint e = 0u; e < SORT_ELEMS; e++) {
-            uint idx = base + e * SORT_THREADS + lid;
-            mv[e] = idx < n;
-            mk[e] = mv[e] ? src[idx] : 0xFFFFFFFFu;
-            md[e] = mv[e] ? ((mk[e] >> shift) & 0xFFu) : 0xFFu;
-            if (has_values) {
-                mv_vals[e] = mv[e] ? src_vals[idx] : 0u;
-            }
-        }
-
-        // ── Phase 2: Per-SG atomic histogram ─────────────────────
-        for (uint e = 0u; e < SORT_ELEMS; e++) {
-            if (mv[e]) {
-                atomic_fetch_add_explicit(
-                    &sg_hist_or_rank[simd_id * SORT_NUM_BINS + md[e]],
-                    1u, memory_order_relaxed);
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // ── Phase 2b: Tile histogram + cross-SG prefix ───────────
-        {
-            uint total = 0u;
-            for (uint sg = 0u; sg < SORT_NUM_SGS; sg++) {
-                uint c = atomic_load_explicit(
-                    &sg_hist_or_rank[sg * SORT_NUM_BINS + lid],
-                    memory_order_relaxed);
-                sg_prefix[sg * SORT_NUM_BINS + lid] = total;
-                total += c;
-            }
-            tile_hist[lid] = total;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // ── Phase 3: Atomic fetch-add on global counters ─────────
-        {
-            tile_base[lid] = atomic_fetch_add_explicit(
-                &counters[lid], tile_hist[lid], memory_order_relaxed);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // ── Phase 4: Per-SG ranking + scatter ────────────────────
-        for (uint i = lid; i < SORT_NUM_SGS * SORT_NUM_BINS; i += SORT_THREADS) {
-            atomic_store_explicit(&sg_hist_or_rank[i], 0u, memory_order_relaxed);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (uint e = 0u; e < SORT_ELEMS; e++) {
-            if (mv[e]) {
-                uint d = md[e];
-                uint within_sg = atomic_fetch_add_explicit(
-                    &sg_hist_or_rank[simd_id * SORT_NUM_BINS + d],
-                    1u, memory_order_relaxed);
-                uint gp = tile_base[d]
-                         + sg_prefix[simd_id * SORT_NUM_BINS + d]
-                         + within_sg;
-                dst[gp] = mk[e];
-                if (has_values) {
-                    dst_vals[gp] = mv_vals[e];
-                }
+                dst_vals[dst_idx] = src_vals[base + orig];
             }
         }
     }
+    threadgroup_barrier(mem_flags::mem_device);
 }
 
 // ═══════════════════════════════════════════════════════════════════
